@@ -72,8 +72,8 @@ disallow_any_generics = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-# pyluach ships no type stubs and has no types-* package on PyPI.
-module = ["pyluach.*"]
+# None of these ship type stubs, and no types-* packages exist for them on PyPI.
+module = ["pyluach.*", "numpyro.*", "arviz.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -23,5 +23,11 @@ site/
 .env.*
 !.env.example
 
+# Local agent configuration. Untracked because settings.json embeds machine-specific
+# absolute paths. Note that this also keeps the PreToolUse attribution hook out of a cold
+# clone; the tool-independent guard in scripts/install-git-hooks.sh is the enforcing layer
+# and stays tracked.
+.claude/
+
 # macOS
 .DS_Store
