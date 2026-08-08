@@ -76,10 +76,10 @@ What works today — generate three years of synthetic data with known parameter
 ```python
 from liftlab import generate_panel
 
-panel = generate_panel()          # 1,095 daily rows, five channels
-panel.data.head()                 # spend_search … spend_email, revenue
-panel.truth.parameter_table()     # the parameters that produced it
-panel.truth.roas                  # realised true ROAS per channel
+panel = generate_panel()  # 1,095 daily rows, five channels
+panel.data.head()  # spend_search … spend_email, revenue
+panel.truth.parameter_table()  # the parameters that produced it
+panel.truth.roas  # realised true ROAS per channel
 ```
 
 The transforms are usable directly:

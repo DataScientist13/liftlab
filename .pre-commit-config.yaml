@@ -5,6 +5,10 @@ repos:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
+        # ruff formats Python code blocks inside Markdown, and CI runs `ruff format
+        # --check .` across the whole tree. Without this the hook checks a narrower file
+        # set than CI, so a README code block can pass locally and then fail the build.
+        types_or: [python, pyi, jupyter, markdown]
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
