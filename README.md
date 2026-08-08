@@ -3,10 +3,11 @@
 **Bayesian marketing mix modeling calibrated by geo-incrementality experiments — with a budget
 optimizer that carries posterior uncertainty into the recommendation instead of discarding it.**
 
-> **Status: in active development (v0.1.0).** The media transforms and the project spine are in
-> place; the MMM core, geo-lift module, calibration bridge, optimizer, and recovery benchmark are
-> not built yet. Sections below that depend on results say so explicitly rather than showing
-> placeholder numbers. Nothing in this README is claimed until a named command produces it.
+> **Status: in active development (v0.1.0).** The media transforms, the Israeli retail calendar,
+> and the synthetic data-generating process are in place; the MMM core, geo-lift module,
+> calibration bridge, optimizer, and recovery benchmark are not built yet. Sections below that
+> depend on results say so explicitly rather than showing placeholder numbers. Nothing in this
+> README is claimed until a named command produces it.
 
 ## Why
 
@@ -70,7 +71,18 @@ just test
 `just setup` installs dependencies with `uv`, wires up `pre-commit`, and installs the repository's
 `commit-msg` guard. It works from a cold clone with no manual steps.
 
-What works today:
+What works today — generate three years of synthetic data with known parameters:
+
+```python
+from liftlab import generate_panel
+
+panel = generate_panel()          # 1,095 daily rows, five channels
+panel.data.head()                 # spend_search … spend_email, revenue
+panel.truth.parameter_table()     # the parameters that produced it
+panel.truth.roas                  # realised true ROAS per channel
+```
+
+The transforms are usable directly:
 
 ```python
 import numpy as np
@@ -100,11 +112,27 @@ Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
 
 ## Demo data
 
-The demo dataset will be **synthetic Israeli e-commerce**, not a scraped or borrowed real one:
-Hebrew channel names, the Israeli holiday calendar (Pesach and Rosh Hashana retail spikes, Yom
-Kippur hard zeroes, Ramadan effects in mixed markets), and a Saturday-trough weekly cycle. The
-data-generating process is documented and seeded, which is precisely what makes the recovery
-benchmark meaningful: ground truth is knowable.
+The demo dataset is **synthetic Israeli e-commerce**, not a scraped or borrowed real one. Three
+years of daily data across five channels with Hebrew names — חיפוש ממומן, מדיה חברתית, וידאו,
+טלוויזיה, דיוור אלקטרוני — spanning fast carryover (search) and slow, delayed-peak carryover (TV).
+
+Calendar effects are real, not decorative:
+
+- **Saturday trough, Thursday peak.** The Israeli working week runs Sunday to Thursday, and most
+  retail closes for Shabbat.
+- **Pre-holiday surges.** A fortnight-long ramp into Pesach and Rosh Hashana, peaking on the eve.
+- **Yom Kippur.** Commerce stops. Modelled as a supply-side closure applied to *total* revenue, not
+  just the organic baseline — advertising that ran beforehand sells nothing on a day when nobody
+  can buy.
+
+Holiday dates are derived from the Hebrew calendar via [`pyluach`](https://pypi.org/project/pyluach/),
+never hardcoded. The Hebrew calendar is lunisolar, so these dates move by weeks across Gregorian
+years; a hardcoded table is how a project like this silently ships wrong seasonality.
+
+The DGP is documented and seeded, which is what makes the recovery benchmark meaningful: ground
+truth is knowable. Spend is deliberately generated with both daily variation and discrete campaign
+flights, because a channel held at constant budget carries almost no information about its own
+carryover or saturation.
 
 ## Limitations
 
@@ -113,6 +141,9 @@ Stated up front, because a measurement tool that hides its assumptions is worse 
 - **MMM is not an experiment.** Even calibrated, it rests on assumptions about functional form and
   unobserved confounders. It narrows the uncertainty around incrementality; it does not eliminate
   it.
+- **Ramadan is not modelled.** It shifts retail meaningfully in mixed and Arab-majority localities,
+  but doing it properly needs the Hijri calendar and locality weighting, which means a geo-resolved
+  model. Approximating it would be worse than leaving it out and saying so.
 - **Geo-lift transfers imperfectly.** A lift estimate is measured for one channel, one creative
   mix, one time window, one set of markets. Using it as a prior for a global coefficient assumes
   that estimate generalises — an assumption that is often wrong when creative or competitive

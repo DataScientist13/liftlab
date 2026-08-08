@@ -18,6 +18,7 @@ classifiers = [
 dependencies = [
   "numpy>=1.26",
   "pandas>=2.2",
+  "pyluach>=2.2",
   "scipy>=1.13",
 ]
 
@@ -69,6 +70,11 @@ strict = true
 warn_unreachable = true
 disallow_any_generics = true
 files = ["src"]
+
+[[tool.mypy.overrides]]
+# pyluach ships no type stubs and has no types-* package on PyPI.
+module = ["pyluach.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 addopts = "-q --cov=src --cov-report=term-missing --cov-fail-under=80"
