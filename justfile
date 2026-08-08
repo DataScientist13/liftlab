@@ -20,7 +20,8 @@ fix:
     uv run ruff format .
 
 # Parameter-recovery benchmark: simulate a known DGP, fit, report bias and coverage.
-recover:
-    uv run python -m liftlab.recovery
+# Pass --profile full for the publication run, --check to fail on coverage drift.
+recover *ARGS:
+    uv run python -m liftlab.recovery {{ARGS}}
 
 all: lint test
