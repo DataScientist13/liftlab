@@ -64,15 +64,23 @@ independent replications of three years of daily data across five channels.
 just recover --profile full
 ```
 
-| parameter | n | mean rel. bias | median abs rel. bias | coverage 95% | coverage 50% |
+| parameter | n | bias (mean est.) | bias (median est.) | median abs rel. bias | coverage 95% |
 | --- | --- | --- | --- | --- | --- |
-| roas | 40 | +26.4% | 30.9% | **92%** | 48% |
-| beta | 40 | +40.1% | 22.7% | 98% | 42% |
-| half_saturation | 40 | +53.1% | 24.5% | 98% | 65% |
-| decay | 32 | +14.4% | 14.3% | 97% | 47% |
-| slope | 40 | +6.5% | 19.9% | 100% | 50% |
+| roas | 50 | **+5.2%** | **−1.1%** | 25.5% | 90% |
+| beta | 50 | +18.2% | +7.9% | 20.7% | 98% |
+| half_saturation | 50 | +38.2% | +17.2% | 33.8% | 98% |
+| decay | 40 | +7.1% | +6.0% | 13.0% | 98% |
+| slope | 50 | +4.8% | +0.2% | 19.8% | 100% |
 
 Full report and per-replication raw data: [`docs/recovery/`](docs/recovery/).
+
+An earlier version of this model showed a systematic **+26% upward offset** on ROAS. The cause was
+diagnosed and fixed — the prior sat on the Hill asymptote, the least identified quantity in the
+system, so it did the likelihood's work in the flat direction — by sampling each channel's realised
+ROAS directly and deriving the asymptote from it
+([ADR 0005](docs/adr/0005-roas-parameterisation.md)). Both point-estimator columns are reported
+because the mean of a right-skewed posterior sits above its centre by construction; the median
+column shows the estimates are now essentially unbiased in aggregate.
 
 ### Does calibration help?
 
@@ -85,18 +93,18 @@ just recover --profile calibrated
 just compare
 ```
 
-Paired over the 8 replications healthy in **both** arms, because the two exclude different seeds
+Paired over the 9 replications healthy in **both** arms, because the two exclude different seeds
 for divergences and comparing their summary tables directly would confound the effect with a change
 in which replications were counted. Each cell reads *uncalibrated → calibrated*:
 
 | channel group | n | median abs ROAS error | coverage 95% | 95% interval width |
 | --- | --- | --- | --- | --- |
-| tested (search, social) | 16 | **19.0% → 9.2%** | 100% → 100% | 2.10 → **1.42** |
-| untested | 24 | 49.2% → 45.6% | 88% → 88% | 3.17 → 2.97 |
-| all channels | 40 | 30.9% → 23.0% | 92% → 92% | 2.42 → 1.60 |
+| tested (search, social) | 18 | **12.8% → 8.5%** | 100% → 100% | 2.33 → **1.37** |
+| untested | 27 | 41.5% → 39.8% | 81% → 85% | 3.00 → 2.73 |
+| all channels | 45 | 26.2% → 21.0% | 89% → 91% | 2.52 → 1.59 |
 
-**Calibration roughly halves the error on the channels you test, and the intervals get ~32%
-narrower without coverage degrading** — more precise, not merely more confident.
+**Calibration cuts the error on the channels you test by a third and narrows their intervals by
+~40% without coverage degrading** — more precise, not merely more confident.
 
 **It barely helps the channels you don't test.** Pinning one channel's contribution does constrain
 what is left for the others to explain, but that spillover turns out to be weak. The practical
@@ -105,25 +113,27 @@ you want a trustworthy number for. Calibration is not a free lunch that a single
 across the media plan.
 
 **Read it like this.** Coverage is the number that matters. A 95% credible interval should contain
-the truth about 95% of the time, and here it does — 92% for ROAS, 97–100% elsewhere. The intervals
-are honest: when this model says it is uncertain, it genuinely is. A biased estimate with an honest
-interval is usable; a well-centred estimate with overconfident intervals moves someone's budget on
-a number that was never that certain.
+the truth about 95% of the time, and here it does — 90% for ROAS (within sampling error of nominal
+at this replication count), 97–100% elsewhere. The intervals are honest: when this model says it is
+uncertain, it genuinely is. A biased estimate with an honest interval is usable; a well-centred
+estimate with overconfident intervals moves someone's budget on a number that was never that
+certain.
 
-**The point estimates are biased upward**, consistently: +26% on ROAS, +40% on channel
-coefficients. Part of that is reporting the posterior *mean* of a right-skewed posterior, which
-sits above the median by construction. The rest is real, and it is the reason this repository
-exists — see Limitations.
+**The aggregate offset is gone, but per-channel error is not.** The 25.5% median absolute ROAS
+error is spread, not slant: it concentrates in the low-spend channels whose spend never approaches
+saturation, where the data is weakest and the informative ROAS prior does the most work. The fix
+for those channels is not more modeling — it is an experiment, which is what the table above
+measures.
 
-Carryover recovers best (14% median absolute error on decay), effect sizes worst. That ordering is
+Carryover recovers best (13% median absolute error on decay), effect sizes worst. That ordering is
 not incidental: carryover is identified by the *shape* of the response over time, which the data
 constrains well, while effect size is identified by its *level*, which trades off against the
 organic baseline.
 
-**Four of twelve replications were excluded** for exceeding 2% divergent transitions, even at
+**Two of twelve replications were excluded** for exceeding 2% divergent transitions, even at
 `target_accept_prob = 0.95`. R-hat and bulk ESS were fine in every run — divergences were the only
-failure mode. A third of runs needing exclusion is a real weakness of the current parameterisation,
-not a rounding detail, and it is the next thing to fix.
+failure mode. Down from four of twelve before the ROAS parameterisation, but not zero, and the
+worst seed still diverges at 9.6%: see Limitations.
 
 ## Quickstart
 
@@ -250,27 +260,27 @@ Stated up front, because a measurement tool that hides its assumptions is worse 
   calibration buys when the experiment is sound; it does not measure the cost of a bad one.
 - **Adstock and saturation trade off against each other.** Slow decay with early saturation can
   mimic fast decay with late saturation. Informative priors and the recovery benchmark are how this
-  is managed, not solved — the benchmark above puts the residual cost at a median 25% absolute
+  is managed, not solved — the benchmark above puts the residual cost at a median 34% absolute
   error on half-saturation.
-- **Channel ROAS is biased upward by roughly a quarter**, measured, not guessed. Use the interval,
-  not the point estimate. This is the concrete argument for the calibration bridge: a geo experiment
-  supplies external information about a channel's incremental effect that the aggregate series
-  simply does not contain, and folding it in as a prior is what pulls the level back.
-- **A third of fits are currently discarded for divergences.** At `target_accept_prob = 0.95`, four
-  of twelve replications exceeded a 2% divergent-transition rate and were excluded from the
-  benchmark. R-hat and ESS looked fine in all of them, which is exactly why divergences are gated
-  separately. The cause is understood — below saturation the Hill curve identifies only the product
-  `beta * k^-s`, leaving a ridge — and a reparameterisation was tried, measured, and **rejected**
-  because it cut divergences but made the intervals overconfident
-  ([ADR 0004](docs/adr/0004-saturation-reparameterisation.md)). This model is not something to run
-  unattended yet.
+- **The ROAS prior is informative, and it shrinks extreme channels.** The near-zero aggregate bias
+  is bought with a `LogNormal(log 1.5, 0.7)` prior on each channel's ROAS — defensible from
+  published lift experiments, but a channel whose true ROAS is far from that centre gets pulled
+  toward it: the benchmark's email channel (true ROAS 4.3) is estimated around 2–3 uncalibrated.
+  For a channel you suspect is an outlier, the model's number is regularised, and the remedy is an
+  experiment on that channel, not a wider prior ([ADR 0005](docs/adr/0005-roas-parameterisation.md)).
+- **A sixth of fits are still discarded for divergences.** Two of twelve replications exceed a 2%
+  divergent-transition rate (down from four before the ROAS parameterisation), and the worst seed
+  diverges at 9.6%. The residual cause is the one ADR 0004 identified: for channels operated far
+  below saturation, the saturation parameters are genuinely unidentified, and an earlier purely
+  geometric fix was rejected for costing interval coverage
+  ([ADR 0004](docs/adr/0004-saturation-reparameterisation.md)). Not something to run unattended yet.
 - **Aggregate data limits resolution.** Weekly national data cannot separate channels whose spend
   moves together. Where correlation is high, the honest output is a wide posterior, not a
   confident number.
 - **The optimizer extrapolates, and inherits everything above.** Budgets outside the historical
   spend range sit on the fitted curve's extrapolation, where the model is least trustworthy, and it
-  optimises over the same curves the benchmark shows are biased upward. Read its allocations as
-  directional, with the interval attached — not as a target to hit.
+  optimises over curves whose per-channel error the benchmark measures at 25% median absolute. Read
+  its allocations as directional, with the interval attached — not as a target to hit.
 
 ## License
 

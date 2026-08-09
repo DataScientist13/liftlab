@@ -24,9 +24,10 @@ Currency-scale quantities are recovered afterwards from the stored scale factors
 confounded with the channel coefficient — the single most common identifiability failure in
 MMM implementations.
 
-**Channel coefficients are hierarchical and non-centered.** Partial pooling across channels
-regularises the small, low-spend ones. The non-centered form avoids the funnel geometry that
-otherwise produces divergences at small ``tau``.
+**The channel level is parameterised as ROAS, not as the Hill asymptote.** Realised ROAS is
+what the data identifies and what an advertiser can hold a prior opinion about; the asymptote
+``beta`` is derived from it. The earlier hierarchical prior on ``beta`` put the prior's weight
+on the least identified quantity in the model, and the recovery benchmark measured the cost.
 
 **Half-saturation is on the spend scale.** After scaling, a value of 1.0 means "half response
 at median spend", which is a quantity a media buyer can actually hold an opinion about.
@@ -366,25 +367,39 @@ def mmm_model(data: MMMData) -> None:
     )
     response = hill_saturation(carried, half_saturation, slope)
 
-    # --- Hierarchical channel coefficients, non-centered ---------------------------------
-    mu_beta = numpyro.sample("mu_beta", dist.Normal(jnp.log(0.08), 0.7))
-    tau_beta = numpyro.sample("tau_beta", dist.HalfNormal(1.0))
-    z_beta = numpyro.sample("z_beta", dist.Normal(0.0, 1.0).expand([n_channels]).to_event(1))
-    beta = numpyro.deterministic("beta", jnp.exp(mu_beta + tau_beta * z_beta))
-
-    contribution = beta[None, :] * response
-
     # --- Yom Kippur closure applies to total demand, not just the baseline ---------------
     open_fraction = 1.0 - closure * jnp.asarray(data.yom_kippur)
-    mu = (baseline + contribution.sum(axis=-1)) * open_fraction
 
-    # Reported in currency units so downstream code never has to redo the scaling.
-    numpyro.deterministic(
-        "roas",
-        (contribution * open_fraction[:, None]).sum(axis=0)
-        * data.revenue_scale
-        / (spend.sum(axis=0) * jnp.asarray(data.spend_scale)),
+    # --- Channel level, parameterised as ROAS --------------------------------------------
+    # The sampled level parameter is each channel's realised ROAS — total incremental
+    # revenue over total spend — and the Hill asymptote `beta` is *derived* from it. Two
+    # reasons, both measured on this model rather than assumed:
+    #
+    # 1. Identification. `beta` is the least identified quantity in the system: below
+    #    saturation the likelihood constrains only the product beta * k**-s, so the prior
+    #    on `beta` does the work where the data cannot, and the recovery benchmark showed
+    #    the result — beta biased +40%, half_saturation +53%, ROAS +26%, driven by the
+    #    weakly identified low-spend channels. Realised ROAS, by contrast, is essentially
+    #    the regression level of the contribution series, which the data pins well. With
+    #    the level sampled directly, k and slope only carry curve *shape*.
+    #
+    # 2. Elicitability. ROAS is the one level quantity with a defensible prior that does
+    #    not reference this DGP: incremental ROAS above ~6 is rare in published lift
+    #    experiments, and below ~0.3 the channel is burning money. LogNormal(log 1.5, 0.7)
+    #    spans [0.38, 5.9] at 95%. A prior on the abstract asymptote of a saturation curve
+    #    is a number nobody can hold an opinion about.
+    roas = numpyro.sample(
+        "roas", dist.LogNormal(jnp.log(1.5), 0.7).expand([n_channels]).to_event(1)
     )
+    total_spend = spend.sum(axis=0) * jnp.asarray(data.spend_scale)
+    delivered_response = (response * open_fraction[:, None]).sum(axis=0)
+    beta = numpyro.deterministic(
+        "beta",
+        roas * total_spend / (data.revenue_scale * jnp.maximum(delivered_response, 1e-9)),
+    )
+    contribution = beta[None, :] * response
+
+    mu = (baseline + contribution.sum(axis=-1)) * open_fraction
 
     sigma = numpyro.sample("sigma", dist.HalfNormal(0.2))
     obs = None if data.revenue is None else jnp.asarray(data.revenue)

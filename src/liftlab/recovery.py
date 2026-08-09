@@ -333,6 +333,7 @@ def run_seed(seed: int, profile: BenchmarkProfile) -> pd.DataFrame:
         lo95, hi95 = np.quantile(draws, [0.025, 0.975])
         lo50, hi50 = np.quantile(draws, [0.25, 0.75])
         mean = float(draws.mean())
+        median = float(np.median(draws))
         records.append(
             {
                 "seed": seed,
@@ -341,10 +342,15 @@ def run_seed(seed: int, profile: BenchmarkProfile) -> pd.DataFrame:
                 "parameter": row["parameter"],
                 "truth": truth,
                 "posterior_mean": mean,
+                "posterior_median": median,
                 "posterior_sd": float(draws.std()),
                 "q025": float(lo95),
                 "q975": float(hi95),
                 "relative_bias": (mean - truth) / truth,
+                # The mean of a right-skewed posterior sits above its centre by
+                # construction; scoring the median separates that estimator artifact
+                # from genuine estimation bias.
+                "relative_bias_median": (median - truth) / truth,
                 "covered_95": bool(lo95 <= truth <= hi95),
                 "covered_50": bool(lo50 <= truth <= hi50),
                 "interval_width_95": float(hi95 - lo95),
@@ -391,6 +397,7 @@ def summarise(results: pd.DataFrame, profile: BenchmarkProfile) -> pd.DataFrame:
         {
             "n": grouped.size(),
             "mean_relative_bias": grouped["relative_bias"].mean(),
+            "mean_relative_bias_median": grouped["relative_bias_median"].mean(),
             "median_abs_relative_bias": grouped["relative_bias"].apply(lambda s: s.abs().median()),
             "coverage_95": grouped["covered_95"].mean(),
             "coverage_50": grouped["covered_50"].mean(),
@@ -513,13 +520,17 @@ def format_report(
 
     table = summary.copy()
     table["mean_relative_bias"] = table["mean_relative_bias"].map(lambda v: f"{v:+.1%}")
+    table["mean_relative_bias_median"] = table["mean_relative_bias_median"].map(
+        lambda v: f"{v:+.1%}"
+    )
     table["median_abs_relative_bias"] = table["median_abs_relative_bias"].map(lambda v: f"{v:.1%}")
     table["coverage_95"] = table["coverage_95"].map(lambda v: f"{v:.0%}")
     table["coverage_50"] = table["coverage_50"].map(lambda v: f"{v:.0%}")
     table["median_interval_width"] = table["median_interval_width"].map(lambda v: f"{v:.2f}")
     table.columns = [
         "n",
-        "mean rel. bias",
+        "bias (mean est.)",
+        "bias (median est.)",
         "median abs rel. bias",
         "coverage 95%",
         "coverage 50%",

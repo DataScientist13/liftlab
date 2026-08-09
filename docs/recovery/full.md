@@ -10,13 +10,13 @@ just recover --profile full
 
 ## Results
 
-| parameter       | n  | mean rel. bias | median abs rel. bias | coverage 95% | coverage 50% | median 95% width |
-|-----------------|----|----------------|----------------------|--------------|--------------|------------------|
-| beta            | 40 | +40.1%         | 22.7%                | 98%          | 42%          | 0.18             |
-| decay           | 32 | +14.4%         | 14.3%                | 97%          | 47%          | 0.27             |
-| half_saturation | 40 | +53.1%         | 24.5%                | 98%          | 65%          | 3.28             |
-| roas            | 40 | +26.4%         | 30.9%                | 92%          | 48%          | 2.42             |
-| slope           | 40 | +6.5%          | 19.9%                | 100%         | 50%          | 1.53             |
+| parameter       | n  | bias (mean est.) | bias (median est.) | median abs rel. bias | coverage 95% | coverage 50% | median 95% width |
+|-----------------|----|------------------|--------------------|----------------------|--------------|--------------|------------------|
+| beta            | 50 | +18.2%           | +7.9%              | 20.7%                | 98%          | 58%          | 0.23             |
+| decay           | 40 | +7.1%            | +6.0%              | 13.0%                | 98%          | 62%          | 0.28             |
+| half_saturation | 50 | +38.2%           | +17.2%             | 33.8%                | 98%          | 70%          | 4.68             |
+| roas            | 50 | +5.2%            | -1.1%              | 25.5%                | 90%          | 42%          | 2.57             |
+| slope           | 50 | +4.8%            | +0.2%              | 19.8%                | 100%         | 46%          | 1.65             |
 
 `coverage 95%` is the fraction of replications whose 95% credible interval contained
 the true value. Nominal is 95%: materially below means the model is overconfident,
@@ -25,8 +25,8 @@ biased estimate with an honest interval is usable, an overconfident one is not.
 
 ## Sampler health
 
-Replications excluded: **4** of 12 — R-hat > 1.05, bulk ESS < 100, or divergence rate > 2%.
+Replications excluded: **2** of 12 — R-hat > 1.05, bulk ESS < 100, or divergence rate > 2%.
 
-Worst divergence rate across replications: **8.8%**. Divergences are treated as a hard exclusion criterion rather than a warning: a divergent chain systematically fails to explore part of the posterior, so its intervals are the wrong width and its coverage is not evidence about the method.
+Worst divergence rate across replications: **9.6%**. Divergences are treated as a hard exclusion criterion rather than a warning: a divergent chain systematically fails to explore part of the posterior, so its intervals are the wrong width and its coverage is not evidence about the method.
 
-Total sampling time 23 min.
+Total sampling time 11 min.
