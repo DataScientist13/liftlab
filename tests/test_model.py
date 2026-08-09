@@ -7,12 +7,14 @@ test suite too slow to run and a benchmark too shallow to trust.
 
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from liftlab.dgp import DEFAULT_CHANNELS, DGPConfig, generate_panel
-from liftlab.model import ChannelModel, fit, prepare_data
+from liftlab.model import ChannelModel, ExperimentResult, fit, prepare_data
 
 
 @pytest.fixture(scope="module")
@@ -132,6 +134,82 @@ class TestFit:
         data = prepare_data(panel.data.drop(columns=["revenue"]), channels)
         with pytest.raises(ValueError, match="requires observed revenue"):
             fit(data, num_warmup=1, num_samples=1, num_chains=1)
+
+
+class TestExperimentResult:
+    def test_rejects_non_positive_standard_error(self):
+        with pytest.raises(ValueError, match="standard_error"):
+            ExperimentResult("search", date(2023, 1, 1), date(2023, 2, 1), 1000.0, 0.0)
+
+    def test_rejects_reversed_window(self):
+        with pytest.raises(ValueError, match="end must not precede"):
+            ExperimentResult("search", date(2023, 3, 1), date(2023, 1, 1), 1000.0, 10.0)
+
+
+class TestCalibrationBridge:
+    @pytest.fixture
+    def experiment(self, panel):
+        window = panel.data.index[10:40]
+        true_incremental = float(panel.truth.contributions["search"].iloc[10:40].sum())
+        return ExperimentResult(
+            channel="search",
+            start=window[0].date(),
+            end=window[-1].date(),
+            incremental_revenue=true_incremental,
+            standard_error=0.2 * true_incremental,
+        )
+
+    def test_no_experiments_by_default(self, panel, channels):
+        assert prepare_data(panel.data, channels).n_experiments == 0
+
+    def test_mask_covers_exactly_the_window(self, panel, channels, experiment):
+        data = prepare_data(panel.data, channels, experiments=(experiment,))
+        assert data.n_experiments == 1
+        assert data.experiment_mask.shape == (1, 120)
+        assert data.experiment_mask.sum() == 30
+
+    def test_channel_index_points_at_the_right_column(self, panel, channels, experiment):
+        data = prepare_data(panel.data, channels, experiments=(experiment,))
+        assert channels[int(data.experiment_channel[0])].slug == "search"
+
+    def test_rejects_unknown_channel(self, panel, channels, experiment):
+        bad = ExperimentResult("nosuchchannel", experiment.start, experiment.end, 1.0, 1.0)
+        with pytest.raises(ValueError, match="unknown channel"):
+            prepare_data(panel.data, channels, experiments=(bad,))
+
+    def test_rejects_window_outside_the_panel(self, panel, channels):
+        stale = ExperimentResult("search", date(1999, 1, 1), date(1999, 2, 1), 1.0, 1.0)
+        with pytest.raises(ValueError, match="does not overlap"):
+            prepare_data(panel.data, channels, experiments=(stale,))
+
+    def test_fit_exposes_the_experiment_prediction(self, panel, channels, experiment):
+        data = prepare_data(panel.data, channels, experiments=(experiment,))
+        idata = fit(data, num_warmup=30, num_samples=30, num_chains=1, seed=0)
+        predicted = idata.posterior["experiment_predicted"]
+        assert predicted.shape == (1, 30, 1)
+        assert np.all(predicted.values > 0)
+
+    def test_a_precise_experiment_pulls_the_posterior_toward_it(self, panel, channels):
+        """A tight experiment must move the channel's estimate more than a vague one.
+
+        This is the property that makes the bridge worth having: the standard error, not
+        the point estimate alone, controls how much the experiment is allowed to say.
+        """
+        true_incremental = float(panel.truth.contributions["search"].iloc[10:40].sum())
+        window = panel.data.index[10:40]
+        # Both experiments claim the same (deliberately inflated) effect; they differ only
+        # in how confidently they claim it.
+        claim = 3.0 * true_incremental
+
+        def roas_with(relative_se: float) -> float:
+            experiment = ExperimentResult(
+                "search", window[0].date(), window[-1].date(), claim, relative_se * claim
+            )
+            data = prepare_data(panel.data, channels, experiments=(experiment,))
+            idata = fit(data, num_warmup=150, num_samples=150, num_chains=2, seed=0)
+            return float(idata.posterior["roas"].values[..., 0].mean())
+
+        assert roas_with(0.05) > roas_with(2.0)
 
 
 class TestAllGeometricPanel:

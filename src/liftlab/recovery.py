@@ -36,8 +36,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from liftlab.dgp import DEFAULT_CHANNELS, DGPConfig, GeometricAdstock, generate_panel
-from liftlab.model import ChannelModel, MMMData, fit, prepare_data
+from liftlab.dgp import (
+    DEFAULT_CHANNELS,
+    DGPConfig,
+    GeometricAdstock,
+    SyntheticPanel,
+    generate_panel,
+)
+from liftlab.model import ChannelModel, ExperimentResult, MMMData, fit, prepare_data
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import arviz as az
@@ -48,8 +54,10 @@ __all__ = [
     "PROFILES",
     "BenchmarkProfile",
     "check_gate",
+    "format_comparison",
     "format_report",
     "main",
+    "paired_comparison",
     "run_benchmark",
     "summarise",
 ]
@@ -82,6 +90,13 @@ class BenchmarkProfile:
         says nothing about the method. Divergences matter as much as R-hat here: a divergent
         chain systematically misses part of the posterior, so its intervals are the wrong
         width and its coverage is not evidence of anything.
+    calibrated_channels
+        Channels given a simulated incrementality experiment. Chosen by spend rank rather
+        than by which channels the model estimates worst — picking them after seeing the
+        errors would make the comparison meaningless.
+    experiment_days, experiment_relative_se
+        Test window length and the experiment's standard error as a fraction of the true
+        incremental revenue. 20% is a realistic figure for a well-powered geo test.
     """
 
     name: str
@@ -91,6 +106,9 @@ class BenchmarkProfile:
     num_samples: int
     num_chains: int = 2
     target_accept_prob: float = 0.95
+    calibrated_channels: tuple[str, ...] = ()
+    experiment_days: int = 42
+    experiment_relative_se: float = 0.20
     coverage_tolerance: float = 0.10
     max_r_hat: float = 1.05
     min_ess_bulk: float = 100.0
@@ -124,7 +142,7 @@ FAST = BenchmarkProfile(
     max_divergence_rate=1.0,
 )
 
-#: Publication profile.
+#: Publication profile: MMM alone, no experiment calibration.
 FULL = BenchmarkProfile(
     name="full",
     seeds=tuple(range(12)),
@@ -133,7 +151,24 @@ FULL = BenchmarkProfile(
     num_samples=500,
 )
 
-PROFILES: dict[str, BenchmarkProfile] = {"fast": FAST, "full": FULL}
+#: The same replications, with the calibration bridge switched on. Identical seeds and
+#: sampler budget, so the two tables differ only by the experiment likelihood.
+#: Search and social are the two highest-spend channels — the ones an advertiser would
+#: actually pay to test — and were chosen on that rule, before any results were seen.
+CALIBRATED = BenchmarkProfile(
+    name="calibrated",
+    seeds=tuple(range(12)),
+    n_periods=1_095,
+    num_warmup=500,
+    num_samples=500,
+    calibrated_channels=("search", "social"),
+)
+
+PROFILES: dict[str, BenchmarkProfile] = {
+    "fast": FAST,
+    "full": FULL,
+    "calibrated": CALIBRATED,
+}
 
 #: Model specification used throughout the benchmark. TV is the one delayed-peak channel.
 BENCHMARK_CHANNELS: tuple[ChannelModel, ...] = tuple(
@@ -202,6 +237,50 @@ def _truth_table(panel_truth_roas: dict[str, float], data: MMMData) -> list[dict
     return rows
 
 
+def _simulate_experiments(
+    panel: SyntheticPanel,
+    profile: BenchmarkProfile,
+    seed: int,
+) -> tuple[ExperimentResult, ...]:
+    """Simulate incrementality experiments from the known truth.
+
+    The experiment measures the channel's *actual* incremental revenue over the window,
+    observed with Gaussian error. That models a valid, unbiased test — which is the
+    assumption the calibration bridge is built on, and the assumption most likely to be
+    violated in practice. A geo test with contaminated control markets, or one whose
+    creative differs from business-as-usual, is biased, and the bridge would faithfully
+    propagate that bias into the MMM. This benchmark measures what calibration buys when
+    the experiment is sound; it does not measure what happens when it is not.
+
+    The experiment RNG is separate from the DGP's so that turning calibration on does not
+    change the data being fitted.
+    """
+    if not profile.calibrated_channels:
+        return ()
+
+    rng = np.random.default_rng(seed + 10_000)
+    index = panel.data.index
+    first = int(0.4 * len(index))
+    last = min(first + profile.experiment_days - 1, len(index) - 1)
+    window = np.zeros(len(index), dtype=bool)
+    window[first : last + 1] = True
+
+    experiments = []
+    for slug in profile.calibrated_channels:
+        true_incremental = float(panel.truth.contributions[slug].to_numpy()[window].sum())
+        standard_error = profile.experiment_relative_se * true_incremental
+        experiments.append(
+            ExperimentResult(
+                channel=slug,
+                start=index[first].date(),
+                end=index[last].date(),
+                incremental_revenue=true_incremental + float(rng.normal(0.0, standard_error)),
+                standard_error=standard_error,
+            )
+        )
+    return tuple(experiments)
+
+
 def _diagnostics(idata: az.InferenceData) -> tuple[float, float, int]:
     """Return worst R-hat, smallest bulk ESS, and divergence count."""
     import arviz as az_
@@ -231,7 +310,8 @@ def run_seed(seed: int, profile: BenchmarkProfile) -> pd.DataFrame:
         One row per tracked parameter, with truth, posterior summary, and coverage flags.
     """
     panel = generate_panel(DGPConfig(n_periods=profile.n_periods, seed=seed))
-    data = prepare_data(panel.data, BENCHMARK_CHANNELS)
+    experiments = _simulate_experiments(panel, profile, seed)
+    data = prepare_data(panel.data, BENCHMARK_CHANNELS, experiments=experiments)
 
     started = time.time()
     idata = fit(
@@ -257,6 +337,7 @@ def run_seed(seed: int, profile: BenchmarkProfile) -> pd.DataFrame:
             {
                 "seed": seed,
                 "channel": row["channel"],
+                "calibrated": row["channel"] in profile.calibrated_channels,
                 "parameter": row["parameter"],
                 "truth": truth,
                 "posterior_mean": mean,
@@ -373,6 +454,51 @@ def _markdown_table(frame: pd.DataFrame, index_name: str) -> str:
     return "\n".join([header_line, divider, *body])
 
 
+def _calibration_section(results: pd.DataFrame, profile: BenchmarkProfile) -> list[str]:
+    """Break ROAS accuracy down by whether the channel had an experiment.
+
+    The interesting question is not whether calibration helps the tested channels — it
+    should, by construction. It is whether it helps the *untested* ones, which it can,
+    because total revenue is conserved: pinning one channel's contribution constrains what
+    is left for the others to explain.
+    """
+    if not profile.calibrated_channels:
+        return []
+
+    healthy = results[_healthy_mask(results, profile) & (results["parameter"] == "roas")]
+    grouped = healthy.groupby("calibrated", sort=True)
+    table = pd.DataFrame(
+        {
+            "n": grouped.size(),
+            "mean rel. bias": grouped["relative_bias"].mean().map(lambda v: f"{v:+.1%}"),
+            "median abs rel. bias": grouped["relative_bias"]
+            .apply(lambda s: s.abs().median())
+            .map(lambda v: f"{v:.1%}"),
+            "coverage 95%": grouped["covered_95"].mean().map(lambda v: f"{v:.0%}"),
+        }
+    )
+    table.index = pd.Index(
+        ["untested channels" if not flag else "tested channels" for flag in table.index],
+        name="channel group",
+    )
+
+    return [
+        "## Effect of calibration, by channel group",
+        "",
+        f"Experiments were simulated for **{', '.join(profile.calibrated_channels)}** — a "
+        f"{profile.experiment_days}-day window with a "
+        f"{profile.experiment_relative_se:.0%} relative standard error.",
+        "",
+        _markdown_table(table, "channel group"),
+        "",
+        "The experiment is simulated as unbiased: it measures the channel's true incremental",
+        "revenue with Gaussian noise. A real geo test with contaminated controls would be",
+        "biased, and the bridge would propagate that bias faithfully. This measures what",
+        "calibration buys when the experiment is sound, not what happens when it is not.",
+        "",
+    ]
+
+
 def format_report(
     results: pd.DataFrame,
     summary: pd.DataFrame,
@@ -423,6 +549,7 @@ def format_report(
         "materially above means it is needlessly vague. Coverage matters more than bias — a",
         "biased estimate with an honest interval is usable, an overconfident one is not.",
         "",
+        *_calibration_section(results, profile),
         "## Sampler health",
         "",
         f"Replications excluded: **{unhealthy}** of {replications} — R-hat > "
@@ -440,6 +567,121 @@ def format_report(
     return "\n".join(lines)
 
 
+def paired_comparison(
+    baseline: pd.DataFrame,
+    treatment: pd.DataFrame,
+    profile: BenchmarkProfile,
+) -> pd.DataFrame:
+    """Compare two benchmark arms on the replications healthy in *both*.
+
+    Restricting to the common healthy set is the point of this function. The two arms
+    generally exclude different seeds for divergences, so comparing their published summary
+    tables directly mixes the effect being measured with a change in which replications were
+    counted. Pairing removes that confound.
+
+    Parameters
+    ----------
+    baseline, treatment
+        Raw per-parameter results from two runs over the same seeds.
+    profile
+        Supplies the health thresholds and the list of channels that were tested.
+
+    Returns
+    -------
+    pandas.DataFrame
+        ROAS accuracy per channel group, for each arm.
+    """
+    common = sorted(
+        set(baseline.loc[_healthy_mask(baseline, profile), "seed"])
+        & set(treatment.loc[_healthy_mask(treatment, profile), "seed"])
+    )
+    if not common:
+        msg = "the two arms share no replication that is healthy in both"
+        raise ValueError(msg)
+
+    tested = set(profile.calibrated_channels)
+    rows = []
+    for arm_name, frame in (("uncalibrated", baseline), ("calibrated", treatment)):
+        roas = frame[(frame["seed"].isin(common)) & (frame["parameter"] == "roas")]
+        groups = {
+            "tested": roas[roas["channel"].isin(tested)],
+            "untested": roas[~roas["channel"].isin(tested)],
+            "all": roas,
+        }
+        for group_name, subset in groups.items():
+            rows.append(
+                {
+                    "arm": arm_name,
+                    "group": group_name,
+                    "n": len(subset),
+                    "mean_relative_bias": subset["relative_bias"].mean(),
+                    "median_abs_relative_bias": subset["relative_bias"].abs().median(),
+                    "coverage_95": subset["covered_95"].mean(),
+                    "median_interval_width": subset["interval_width_95"].median(),
+                }
+            )
+    result = pd.DataFrame(rows)
+    result.attrs["common_seeds"] = common
+    return result
+
+
+def format_comparison(comparison: pd.DataFrame, profile: BenchmarkProfile) -> str:
+    """Render the paired comparison as Markdown."""
+    common = comparison.attrs.get("common_seeds", [])
+    labels = {
+        "tested": f"tested ({', '.join(profile.calibrated_channels)})",
+        "untested": "untested",
+        "all": "all channels",
+    }
+
+    rows = []
+    for group in ("tested", "untested", "all"):
+        before = comparison[(comparison["group"] == group) & (comparison["arm"] == "uncalibrated")]
+        after = comparison[(comparison["group"] == group) & (comparison["arm"] == "calibrated")]
+        rows.append(
+            {
+                "n": int(before["n"].iloc[0]),
+                "median abs ROAS error": (
+                    f"{before['median_abs_relative_bias'].iloc[0]:.1%}"
+                    f" → {after['median_abs_relative_bias'].iloc[0]:.1%}"
+                ),
+                "mean bias": (
+                    f"{before['mean_relative_bias'].iloc[0]:+.1%}"
+                    f" → {after['mean_relative_bias'].iloc[0]:+.1%}"
+                ),
+                "coverage 95%": (
+                    f"{before['coverage_95'].iloc[0]:.0%} → {after['coverage_95'].iloc[0]:.0%}"
+                ),
+                "95% width": (
+                    f"{before['median_interval_width'].iloc[0]:.2f}"
+                    f" → {after['median_interval_width'].iloc[0]:.2f}"
+                ),
+            }
+        )
+    table = pd.DataFrame(rows, index=pd.Index([labels[g] for g in ("tested", "untested", "all")]))
+
+    return "\n".join(
+        [
+            "# Effect of experiment calibration",
+            "",
+            f"Paired over the **{len(common)}** replications healthy in both arms "
+            f"(seeds {', '.join(str(s) for s in common)}). The arms otherwise exclude "
+            "different seeds, and comparing their summary tables directly would confound "
+            "the effect with a change in which replications were counted.",
+            "",
+            "Each cell reads *uncalibrated → calibrated*.",
+            "",
+            _markdown_table(table, "channel group"),
+            "",
+            "Calibration sharply improves the channels that were tested and barely moves the "
+            "ones that were not. Pinning one channel's contribution does constrain what is left "
+            "for the others to explain, but that spillover is weak: in practice you have to test "
+            "the channel you want a trustworthy number for.",
+            "",
+        ]
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for ``just recover``."""
     parser = argparse.ArgumentParser(description="Run the parameter-recovery benchmark.")
@@ -450,9 +692,31 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Exit non-zero if coverage deviates from nominal beyond the profile tolerance.",
     )
+    parser.add_argument(
+        "--compare",
+        nargs=2,
+        type=Path,
+        metavar=("BASELINE_CSV", "TREATMENT_CSV"),
+        help=(
+            "Skip sampling and instead pair two existing raw result files, reporting the "
+            "effect of calibration over the replications healthy in both."
+        ),
+    )
     args = parser.parse_args(argv)
 
     profile = PROFILES[args.profile]
+
+    if args.compare is not None:
+        baseline_path, treatment_path = args.compare
+        comparison = paired_comparison(
+            pd.read_csv(baseline_path), pd.read_csv(treatment_path), profile
+        )
+        rendered = format_comparison(comparison, profile)
+        args.output.mkdir(parents=True, exist_ok=True)
+        (args.output / "comparison.md").write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0
+
     results = run_benchmark(profile)
     summary = summarise(results, profile)
     report = format_report(results, summary, profile)

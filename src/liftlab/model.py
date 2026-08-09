@@ -34,7 +34,8 @@ at median spend", which is a quantity a media buyer can actually hold an opinion
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from typing import TYPE_CHECKING, Literal
 
 import jax
@@ -53,6 +54,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "ChannelModel",
+    "ExperimentResult",
     "MMMData",
     "fit",
     "mmm_model",
@@ -84,6 +86,46 @@ class ChannelModel:
 
 
 @dataclass(frozen=True)
+class ExperimentResult:
+    """A completed incrementality experiment for one channel over one window.
+
+    This is the calibration bridge's input. ``liftlab`` does not run or analyse the
+    experiment — the number comes from wherever the test was actually measured (a geo
+    holdout, Meta Conversion Lift, a Google geo experiment, an in-house synthetic control).
+    What matters here is that it is an estimate of *incremental revenue* with an honest
+    standard error, on the same currency scale as the panel's revenue column.
+
+    Attributes
+    ----------
+    channel
+        Slug of the channel the experiment tested.
+    start, end
+        Inclusive window the experiment covered, in the panel's calendar.
+    incremental_revenue
+        Estimated incremental revenue attributable to the channel over the window.
+    standard_error
+        Standard error of that estimate. This is what controls how hard the experiment
+        pulls the model: a noisy test moves the posterior very little, which is the correct
+        behaviour and the reason the bridge takes an interval rather than a point.
+    """
+
+    channel: str
+    start: date
+    end: date
+    incremental_revenue: float
+    standard_error: float
+
+    def __post_init__(self) -> None:
+        """Reject an experiment that cannot carry information."""
+        if self.standard_error <= 0:
+            msg = "standard_error must be positive"
+            raise ValueError(msg)
+        if self.end < self.start:
+            msg = "experiment end must not precede its start"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
 class MMMData:
     """Model-ready arrays plus the scale factors needed to return to currency units."""
 
@@ -97,6 +139,10 @@ class MMMData:
     spend_scale: np.ndarray
     revenue_scale: float
     revenue: np.ndarray | None = None
+    experiment_mask: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
+    experiment_channel: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
+    experiment_value: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    experiment_se: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
     @property
     def n_periods(self) -> int:
@@ -107,6 +153,11 @@ class MMMData:
     def n_channels(self) -> int:
         """Number of media channels."""
         return int(self.spend.shape[1])
+
+    @property
+    def n_experiments(self) -> int:
+        """Number of calibrating experiments."""
+        return int(self.experiment_value.shape[0])
 
 
 def _fourier_terms(index: pd.DatetimeIndex, period: float, order: int) -> np.ndarray:
@@ -119,10 +170,45 @@ def _fourier_terms(index: pd.DatetimeIndex, period: float, order: int) -> np.nda
     return np.column_stack(terms)
 
 
+def _experiment_arrays(
+    index: pd.DatetimeIndex,
+    channels: tuple[ChannelModel, ...],
+    experiments: tuple[ExperimentResult, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Turn experiment windows into masks aligned to the panel index."""
+    slugs = [c.slug for c in channels]
+    n_periods = len(index)
+    days = index.date
+
+    masks = np.zeros((len(experiments), n_periods), dtype=np.float64)
+    channel_index = np.zeros(len(experiments), dtype=np.int32)
+    values = np.zeros(len(experiments), dtype=np.float64)
+    errors = np.zeros(len(experiments), dtype=np.float64)
+
+    for position, experiment in enumerate(experiments):
+        if experiment.channel not in slugs:
+            msg = f"experiment references unknown channel {experiment.channel!r}"
+            raise ValueError(msg)
+        mask = (days >= experiment.start) & (days <= experiment.end)
+        if not mask.any():
+            msg = (
+                f"experiment window {experiment.start}..{experiment.end} for "
+                f"{experiment.channel!r} does not overlap the panel"
+            )
+            raise ValueError(msg)
+        masks[position] = mask.astype(np.float64)
+        channel_index[position] = slugs.index(experiment.channel)
+        values[position] = experiment.incremental_revenue
+        errors[position] = experiment.standard_error
+
+    return masks, channel_index, values, errors
+
+
 def prepare_data(
     panel: pd.DataFrame,
     channels: tuple[ChannelModel, ...],
     *,
+    experiments: tuple[ExperimentResult, ...] = (),
     revenue_column: str = "revenue",
     weekly_order: int = 3,
 ) -> MMMData:
@@ -135,6 +221,10 @@ def prepare_data(
         revenue column. Revenue may be absent when preparing data for prediction.
     channels
         Channel specifications, in the order the model should use.
+    experiments
+        Completed incrementality experiments used to calibrate the model. Each becomes an
+        extra likelihood term tying the model's implied incremental revenue over the test
+        window to what the experiment measured.
     revenue_column
         Name of the revenue column. Ignored if absent.
     weekly_order
@@ -174,6 +264,9 @@ def prepare_data(
 
     holidays = holiday_frame(panel.index)
     n = len(panel)
+    exp_mask, exp_channel, exp_value, exp_se = _experiment_arrays(
+        panel.index, channels, experiments
+    )
 
     return MMMData(
         spend=spend_raw / spend_scale,
@@ -188,6 +281,10 @@ def prepare_data(
         spend_scale=spend_scale,
         revenue_scale=revenue_scale,
         revenue=revenue,
+        experiment_mask=exp_mask,
+        experiment_channel=exp_channel,
+        experiment_value=exp_value,
+        experiment_se=exp_se,
     )
 
 
@@ -293,6 +390,27 @@ def mmm_model(data: MMMData) -> None:
     obs = None if data.revenue is None else jnp.asarray(data.revenue)
     numpyro.sample("revenue", dist.LogNormal(jnp.log(mu), sigma), obs=obs)
 
+    # --- Calibration bridge -------------------------------------------------------------
+    # Each experiment enters as an additional observation: what the model implies the
+    # channel contributed over the test window, against what the experiment measured.
+    #
+    # This is deliberately *not* implemented as a hand-derived prior on beta. The mapping
+    # from a lift measurement to a channel coefficient runs through adstock and saturation,
+    # so it depends on decay, half-saturation and slope as well — parameters that are
+    # themselves uncertain. Adding a likelihood term lets NUTS propagate the experiment's
+    # information through that whole mapping, which a prior placed directly on beta cannot.
+    # The standard error does the work: a noisy experiment barely moves the posterior.
+    if data.n_experiments > 0:
+        contribution_currency = contribution * open_fraction[:, None] * data.revenue_scale
+        windowed = jnp.asarray(data.experiment_mask) @ contribution_currency
+        predicted = windowed[jnp.arange(data.n_experiments), jnp.asarray(data.experiment_channel)]
+        numpyro.deterministic("experiment_predicted", predicted)
+        numpyro.sample(
+            "experiment",
+            dist.Normal(predicted, jnp.asarray(data.experiment_se)),
+            obs=jnp.asarray(data.experiment_value),
+        )
+
 
 def fit(
     data: MMMData,
@@ -329,6 +447,12 @@ def fit(
     -----
     Enables JAX 64-bit mode as a global side effect. The adstock recursion runs over a
     thousand time steps and accumulates visible error in float32.
+
+    Chains run in parallel only if this is the first JAX work in the process.
+    ``set_host_device_count`` sets an XLA flag that is read when the backend initialises, so
+    calling it afterwards is silently a no-op and NumPyro falls back to sampling chains
+    sequentially. Results are identical either way — only wall-clock time changes — but it
+    is why a second fit in the same session takes roughly twice as long per chain.
     """
     import arviz as az
 

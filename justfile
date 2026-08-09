@@ -24,4 +24,10 @@ fix:
 recover *ARGS:
     uv run python -m liftlab.recovery {{ARGS}}
 
+# Pair the uncalibrated and calibrated benchmark arms over their common healthy seeds.
+compare:
+    uv run python -m liftlab.recovery --profile calibrated \
+        --compare docs/recovery/full-raw.csv docs/recovery/calibrated-raw.csv \
+        --output docs/recovery
+
 all: lint test

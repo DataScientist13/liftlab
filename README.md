@@ -4,9 +4,10 @@
 optimizer that carries posterior uncertainty into the recommendation instead of discarding it.**
 
 > **Status: in active development (v0.1.0).** The MMM core, the Israeli retail calendar, the
-> synthetic DGP, and the parameter-recovery benchmark are in place. The geo-lift module, the
-> calibration bridge, and the budget optimizer are not built yet. Every number below is produced
-> by a named command and nothing is claimed until it has actually run.
+> synthetic DGP, the calibration bridge, and the parameter-recovery benchmark are in place. The
+> budget optimizer is not built yet, and designing or analysing geo experiments is deliberately
+> out of scope — see Architecture. Every number below is produced by a named command, and nothing
+> is claimed until it has actually run.
 
 ## Why
 
@@ -15,37 +16,42 @@ modeling is the standard answer, but MMM alone is only weakly identified: many c
 carryover, saturation, and channel coefficient fit the same aggregate revenue series roughly as
 well. Fitting one of them and reporting it as truth is the common failure mode.
 
-The fix is to calibrate the model against experiments. Geo-based incrementality tests give a
-randomised (or quasi-randomised) estimate of lift for one channel over one window; that estimate
-becomes an informative prior on the corresponding MMM coefficient. This is what Meta and Google do
-internally, and it is rarely demonstrated end to end in public.
+The fix is to calibrate the model against experiments. An incrementality test gives a randomised
+(or quasi-randomised) estimate of lift for one channel over one window — external information the
+aggregate series does not contain. Folding it into the model is what Meta and Google do internally,
+and it is rarely demonstrated end to end in public.
 
-`liftlab` is that pipeline: **design the experiment → run it → fold its posterior into the MMM →
-optimize the budget under uncertainty.**
+`liftlab` is that fold: **take a lift measurement you already have → let it constrain the MMM →
+read the budget implications with the uncertainty intact.**
+
+The benchmark below quantifies what that buys, on data where the right answer is known.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph design["Design"]
-        P[Power analysis / MDE] --> M[Matched-market selection]
+    subgraph inputs["Inputs"]
+        S[("Spend & revenue<br/>panel")]
+        E["Experiment result:<br/>lift ± standard error"]
     end
-    subgraph measure["Measure"]
-        M --> G[Geo-lift: synthetic control / BSTS]
-    end
-    subgraph model["Model"]
-        G -->|posterior becomes prior| B[Calibration bridge]
-        S[(Spend & revenue panel)] --> A[Adstock + saturation]
-        A --> MMM[Hierarchical Bayesian MMM]
+    subgraph core["Model"]
+        S --> A["Adstock + saturation"]
+        A --> MMM["Hierarchical<br/>Bayesian MMM"]
+        E --> B["Calibration bridge:<br/>experiment as likelihood"]
         B --> MMM
     end
-    subgraph decide["Decide"]
-        MMM --> R[Response curves + posterior]
-        R --> O[Constrained budget optimizer]
-        O --> REC[Allocation with uncertainty]
+    subgraph out["Decide"]
+        MMM --> R["Response curves<br/>+ posterior"]
+        R --> O["Constrained budget<br/>optimizer (not built)"]
     end
-    MMM --> V[Recovery benchmark:<br/>known DGP → bias & coverage]
+    MMM --> V["Recovery benchmark:<br/>known DGP → bias & coverage"]
 ```
+
+**`liftlab` does not run or analyse the experiment.** It consumes the result — an incremental
+revenue estimate with a standard error — from wherever the test was actually measured: a geo
+holdout, Meta Conversion Lift, a Google geo experiment, an in-house synthetic control. Designing
+and analysing geo tests is a separate problem with mature tooling, and reimplementing it here would
+add surface area without adding evidence.
 
 ## Results
 
@@ -66,6 +72,36 @@ just recover --profile full
 | slope | 40 | +6.5% | 19.9% | 100% | 50% |
 
 Full report and per-replication raw data: [`docs/recovery/`](docs/recovery/).
+
+### Does calibration help?
+
+The same twelve replications, refit with a simulated incrementality experiment on the two
+highest-spend channels — a 42-day window with a 20% relative standard error. Channels were chosen
+by spend rank before any results were seen, not by which ones fit worst.
+
+```bash
+just recover --profile calibrated
+just compare
+```
+
+Paired over the 8 replications healthy in **both** arms, because the two exclude different seeds
+for divergences and comparing their summary tables directly would confound the effect with a change
+in which replications were counted. Each cell reads *uncalibrated → calibrated*:
+
+| channel group | n | median abs ROAS error | coverage 95% | 95% interval width |
+| --- | --- | --- | --- | --- |
+| tested (search, social) | 16 | **19.0% → 9.2%** | 100% → 100% | 2.10 → **1.42** |
+| untested | 24 | 49.2% → 45.6% | 88% → 88% | 3.17 → 2.97 |
+| all channels | 40 | 30.9% → 23.0% | 92% → 92% | 2.42 → 1.60 |
+
+**Calibration roughly halves the error on the channels you test, and the intervals get ~32%
+narrower without coverage degrading** — more precise, not merely more confident.
+
+**It barely helps the channels you don't test.** Pinning one channel's contribution does constrain
+what is left for the others to explain, but that spillover turns out to be weak. The practical
+implication is unglamorous and worth stating plainly: you have to run the experiment on the channel
+you want a trustworthy number for. Calibration is not a free lunch that a single test spreads
+across the media plan.
 
 **Read it like this.** Coverage is the number that matters. A 95% credible interval should contain
 the truth about 95% of the time, and here it does — 92% for ROAS, 97–100% elsewhere. The intervals
@@ -173,10 +209,13 @@ Stated up front, because a measurement tool that hides its assumptions is worse 
 - **Ramadan is not modelled.** It shifts retail meaningfully in mixed and Arab-majority localities,
   but doing it properly needs the Hijri calendar and locality weighting, which means a geo-resolved
   model. Approximating it would be worse than leaving it out and saying so.
-- **Geo-lift transfers imperfectly.** A lift estimate is measured for one channel, one creative
-  mix, one time window, one set of markets. Using it as a prior for a global coefficient assumes
-  that estimate generalises — an assumption that is often wrong when creative or competitive
-  conditions shift.
+- **Lift estimates transfer imperfectly.** A lift estimate is measured for one channel, one
+  creative mix, one time window, one set of markets. Feeding it into the model assumes that
+  estimate generalises — often wrong when creative or competitive conditions shift.
+- **The bridge trusts the experiment.** It treats the supplied estimate as unbiased and its
+  standard error as honest. A geo test with contaminated control markets is biased, and the bridge
+  will propagate that bias into the MMM with a straight face. The benchmark measures what
+  calibration buys when the experiment is sound; it does not measure the cost of a bad one.
 - **Adstock and saturation trade off against each other.** Slow decay with early saturation can
   mimic fast decay with late saturation. Informative priors and the recovery benchmark are how this
   is managed, not solved — the benchmark above puts the residual cost at a median 25% absolute

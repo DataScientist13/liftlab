@@ -18,15 +18,19 @@ from liftlab.dgp import DEFAULT_CHANNELS, DGPConfig, generate_panel
 from liftlab.model import prepare_data
 from liftlab.recovery import (
     BENCHMARK_CHANNELS,
+    CALIBRATED,
     FAST,
     FULL,
     PROFILES,
     BenchmarkProfile,
     _markdown_table,
+    _simulate_experiments,
     _truth_table,
     check_gate,
+    format_comparison,
     format_report,
     main,
+    paired_comparison,
     summarise,
 )
 
@@ -69,8 +73,19 @@ def _fake_results(coverage_95: float, *, n: int = 20, parameter: str = "roas") -
 
 
 class TestProfiles:
-    def test_registry_exposes_both_profiles(self):
-        assert PROFILES == {"fast": FAST, "full": FULL}
+    def test_registry_exposes_every_profile(self):
+        assert PROFILES == {"fast": FAST, "full": FULL, "calibrated": CALIBRATED}
+
+    def test_calibrated_arm_matches_the_baseline_arm_apart_from_experiments(self):
+        """The two published arms must differ only by the experiment likelihood."""
+        assert CALIBRATED.seeds == FULL.seeds
+        assert CALIBRATED.n_periods == FULL.n_periods
+        assert CALIBRATED.num_warmup == FULL.num_warmup
+        assert CALIBRATED.num_samples == FULL.num_samples
+        assert CALIBRATED.num_chains == FULL.num_chains
+        assert CALIBRATED.target_accept_prob == FULL.target_accept_prob
+        assert FULL.calibrated_channels == ()
+        assert CALIBRATED.calibrated_channels == ("search", "social")
 
     def test_fast_profile_disables_the_coverage_gate(self):
         # Two seeds cannot estimate coverage; asserting on it would be theatre.
@@ -208,6 +223,162 @@ class TestGate:
             coverage_tolerance=0.02,
         )
         assert check_gate(summarise(_fake_results(1.0), profile), profile) != []
+
+
+class TestSimulatedExperiments:
+    @pytest.fixture
+    def panel(self):
+        return generate_panel(DGPConfig(n_periods=300, seed=2))
+
+    def test_no_experiments_when_no_channels_are_calibrated(self, panel):
+        assert _simulate_experiments(panel, FULL, 0) == ()
+
+    def test_one_experiment_per_calibrated_channel(self, panel):
+        profile = replace(FULL, calibrated_channels=("search", "email"))
+        experiments = _simulate_experiments(panel, profile, 0)
+        assert [e.channel for e in experiments] == ["search", "email"]
+
+    def test_window_length_matches_the_profile(self, panel):
+        profile = replace(FULL, calibrated_channels=("search",), experiment_days=30)
+        experiment = _simulate_experiments(panel, profile, 0)[0]
+        assert (experiment.end - experiment.start).days + 1 == 30
+
+    def test_standard_error_is_the_configured_fraction_of_truth(self, panel):
+        profile = replace(
+            FULL, calibrated_channels=("search",), experiment_days=30, experiment_relative_se=0.25
+        )
+        experiment = _simulate_experiments(panel, profile, 0)[0]
+        index = panel.data.index
+        first = int(0.4 * len(index))
+        truth = float(panel.truth.contributions["search"].to_numpy()[first : first + 30].sum())
+        assert experiment.standard_error == pytest.approx(0.25 * truth)
+
+    def test_measurement_is_noisy_but_centred_on_truth(self, panel):
+        """Averaged over many seeds the simulated experiment must be unbiased."""
+        profile = replace(FULL, calibrated_channels=("search",), experiment_days=30)
+        index = panel.data.index
+        first = int(0.4 * len(index))
+        truth = float(panel.truth.contributions["search"].to_numpy()[first : first + 30].sum())
+
+        measured = [
+            _simulate_experiments(panel, profile, seed)[0].incremental_revenue
+            for seed in range(200)
+        ]
+        assert np.mean(measured) == pytest.approx(truth, rel=0.05)
+        assert np.std(measured) > 0
+
+    def test_experiment_noise_does_not_disturb_the_panel(self, panel):
+        """Turning calibration on must not change the data being fitted."""
+        calibrated = replace(FULL, calibrated_channels=("search",))
+        again = generate_panel(DGPConfig(n_periods=300, seed=2))
+        _simulate_experiments(panel, calibrated, 0)
+        assert panel.data.equals(again.data)
+
+
+class TestCalibrationSection:
+    def test_report_gains_a_channel_group_breakdown_when_calibrated(self):
+        profile = replace(FULL, calibrated_channels=("search",))
+        results = _fake_results(1.0, n=6)
+        results["calibrated"] = True
+        report = format_report(results, summarise(results, profile), profile)
+        assert "Effect of calibration, by channel group" in report
+        assert "tested channels" in report
+
+    def test_report_omits_the_breakdown_when_not_calibrated(self):
+        results = _fake_results(1.0, n=6)
+        report = format_report(results, summarise(results, FULL), FULL)
+        assert "Effect of calibration" not in report
+
+
+class TestPairedComparison:
+    @pytest.fixture
+    def profile(self):
+        return replace(FULL, calibrated_channels=("search", "social"))
+
+    def _arm(self, seeds, channels, bias, *, divergence=0.0):
+        rows = []
+        for seed in seeds:
+            for channel in channels:
+                rows.append(
+                    {
+                        "seed": seed,
+                        "channel": channel,
+                        "calibrated": channel in ("search", "social"),
+                        "parameter": "roas",
+                        "truth": 2.0,
+                        "posterior_mean": 2.0 * (1 + bias),
+                        "relative_bias": bias,
+                        "covered_95": True,
+                        "covered_50": True,
+                        "interval_width_95": 1.0,
+                        "max_r_hat": 1.0,
+                        "min_ess_bulk": 500.0,
+                        "divergences": 0,
+                        "divergence_rate": divergence,
+                        "seconds": 1.0,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def test_pairs_only_seeds_healthy_in_both_arms(self, profile):
+        baseline = self._arm([0, 1, 2], ["search"], 0.5)
+        treatment = self._arm([0, 1, 2], ["search"], 0.1)
+        # Seed 2 diverges in the baseline only; it must drop out of both arms.
+        baseline.loc[baseline["seed"] == 2, "divergence_rate"] = 0.5
+
+        comparison = paired_comparison(baseline, treatment, profile)
+
+        assert comparison.attrs["common_seeds"] == [0, 1]
+        assert comparison[comparison["group"] == "all"]["n"].tolist() == [2, 2]
+
+    def test_splits_tested_from_untested_channels(self, profile):
+        baseline = self._arm([0], ["search", "social", "video", "tv", "email"], 0.5)
+        treatment = self._arm([0], ["search", "social", "video", "tv", "email"], 0.1)
+
+        comparison = paired_comparison(baseline, treatment, profile)
+        tested = comparison[comparison["group"] == "tested"]
+        untested = comparison[comparison["group"] == "untested"]
+
+        assert tested["n"].tolist() == [2, 2]
+        assert untested["n"].tolist() == [3, 3]
+
+    def test_raises_when_no_seed_is_healthy_in_both(self, profile):
+        baseline = self._arm([0], ["search"], 0.5, divergence=0.9)
+        treatment = self._arm([0], ["search"], 0.1)
+        with pytest.raises(ValueError, match="no replication that is healthy in both"):
+            paired_comparison(baseline, treatment, profile)
+
+    def test_format_shows_before_and_after_and_the_paired_seed_count(self, profile):
+        baseline = self._arm([0, 1], ["search", "video"], 0.5)
+        treatment = self._arm([0, 1], ["search", "video"], 0.1)
+
+        rendered = format_comparison(paired_comparison(baseline, treatment, profile), profile)
+
+        assert "**2** replications healthy in both" in rendered
+        assert "50.0% → 10.0%" in rendered
+        assert "tested (search, social)" in rendered
+
+    def test_cli_compare_writes_a_report_without_sampling(self, profile, tmp_path, monkeypatch):
+        monkeypatch.setitem(PROFILES, "cmp", profile)
+        baseline = tmp_path / "b.csv"
+        treatment = tmp_path / "t.csv"
+        self._arm([0, 1], ["search", "video"], 0.5).to_csv(baseline, index=False)
+        self._arm([0, 1], ["search", "video"], 0.1).to_csv(treatment, index=False)
+
+        exit_code = main(
+            [
+                "--profile",
+                "cmp",
+                "--compare",
+                str(baseline),
+                str(treatment),
+                "--output",
+                str(tmp_path),
+            ]
+        )
+
+        assert exit_code == 0
+        assert "Effect of experiment calibration" in (tmp_path / "comparison.md").read_text()
 
 
 class TestMarkdownTable:
