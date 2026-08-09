@@ -15,6 +15,11 @@ from liftlab.israel_calendar import (
     jewish_holiday_dates,
     weekly_seasonality,
 )
+from liftlab.optimizer import (
+    Allocation,
+    ResponseCurves,
+    optimize_budget,
+)
 from liftlab.transforms import (
     geometric_adstock,
     hill_saturation,
@@ -26,10 +31,12 @@ __version__ = "0.1.0"
 
 __all__ = [
     "DEFAULT_CHANNELS",
+    "Allocation",
     "ChannelSpec",
     "DGPConfig",
     "GeometricAdstock",
     "GroundTruth",
+    "ResponseCurves",
     "SyntheticPanel",
     "WeibullAdstock",
     "__version__",
@@ -38,6 +45,7 @@ __all__ = [
     "hill_saturation",
     "holiday_frame",
     "jewish_holiday_dates",
+    "optimize_budget",
     "weekly_seasonality",
     "weibull_adstock",
     "weibull_weights",

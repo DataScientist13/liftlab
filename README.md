@@ -4,10 +4,10 @@
 optimizer that carries posterior uncertainty into the recommendation instead of discarding it.**
 
 > **Status: in active development (v0.1.0).** The MMM core, the Israeli retail calendar, the
-> synthetic DGP, the calibration bridge, and the parameter-recovery benchmark are in place. The
-> budget optimizer is not built yet, and designing or analysing geo experiments is deliberately
-> out of scope — see Architecture. Every number below is produced by a named command, and nothing
-> is claimed until it has actually run.
+> synthetic DGP, the calibration bridge, the parameter-recovery benchmark, and the budget optimizer
+> are in place. Designing or analysing geo experiments is deliberately out of scope — see
+> Architecture. Every number below is produced by a named command, and nothing is claimed until it
+> has actually run.
 
 ## Why
 
@@ -42,7 +42,8 @@ flowchart LR
     end
     subgraph out["Decide"]
         MMM --> R["Response curves<br/>+ posterior"]
-        R --> O["Constrained budget<br/>optimizer (not built)"]
+        R --> O["Constrained budget<br/>optimizer"]
+        O --> P["Allocation with<br/>a revenue interval"]
     end
     MMM --> V["Recovery benchmark:<br/>known DGP → bias & coverage"]
 ```
@@ -163,6 +164,37 @@ carried = geometric_adstock(spend, decay=0.6, normalize=True)
 response = hill_saturation(carried, half_saturation=80.0, slope=1.5)
 ```
 
+## Budget optimizer
+
+Allocates a budget across channels over the fitted response curves, subject to a total and
+per-channel bounds:
+
+```python
+from liftlab import ResponseCurves, optimize_budget
+
+curves = ResponseCurves.from_posterior(idata, channels, data.spend_scale, data.revenue_scale)
+plan = optimize_budget(
+    curves,
+    total_daily_budget=25_000,
+    n_days=30,
+    bounds={"tv": (2_000, 8_000)},  # contractual minimum, inventory ceiling
+)
+
+plan.to_frame()  # daily spend per channel
+plan.expected_revenue  # posterior mean incremental revenue
+plan.revenue_interval(0.95)  # and the range it could plausibly be
+```
+
+It maximises **the posterior mean of revenue**, not the revenue implied by the posterior mean of
+the parameters. Those are not the same quantity — the response curve is nonlinear, so by Jensen's
+inequality averaging curves and averaging parameters give different answers, and the second is
+systematically over-optimistic about channels whose saturation is uncertain. Given the recovery
+benchmark shows the point estimates are the least trustworthy part of the fit, collapsing the
+posterior before optimising would throw away the only thing the Bayesian machinery bought.
+
+Every allocation comes back with the posterior distribution of its incremental revenue, so a
+recommendation can be reported as a range rather than a suspiciously precise number.
+
 ## Development
 
 | Command        | What it does                          |
@@ -227,12 +259,18 @@ Stated up front, because a measurement tool that hides its assumptions is worse 
 - **A third of fits are currently discarded for divergences.** At `target_accept_prob = 0.95`, four
   of twelve replications exceeded a 2% divergent-transition rate and were excluded from the
   benchmark. R-hat and ESS looked fine in all of them, which is exactly why divergences are gated
-  separately. The parameterisation needs more work before this model is something to run unattended.
+  separately. The cause is understood — below saturation the Hill curve identifies only the product
+  `beta * k^-s`, leaving a ridge — and a reparameterisation was tried, measured, and **rejected**
+  because it cut divergences but made the intervals overconfident
+  ([ADR 0004](docs/adr/0004-saturation-reparameterisation.md)). This model is not something to run
+  unattended yet.
 - **Aggregate data limits resolution.** Weekly national data cannot separate channels whose spend
   moves together. Where correlation is high, the honest output is a wide posterior, not a
   confident number.
-- **The optimizer extrapolates.** Recommended budgets outside the historical spend range sit on the
-  fitted curve's extrapolation, where the model is least trustworthy.
+- **The optimizer extrapolates, and inherits everything above.** Budgets outside the historical
+  spend range sit on the fitted curve's extrapolation, where the model is least trustworthy, and it
+  optimises over the same curves the benchmark shows are biased upward. Read its allocations as
+  directional, with the interval attached — not as a target to hit.
 
 ## License
 

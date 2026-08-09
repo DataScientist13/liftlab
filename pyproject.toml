@@ -72,8 +72,10 @@ disallow_any_generics = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-# None of these ship type stubs, and no types-* packages exist for them on PyPI.
-module = ["pyluach.*", "numpyro.*", "arviz.*"]
+# None of these ship type information usable here. `scipy-stubs` does exist, but its
+# `minimize` overloads reject a plain constraint dict — scipy's own documented calling
+# convention — so adopting it means annotating around the stubs rather than gaining safety.
+module = ["pyluach.*", "numpyro.*", "arviz.*", "scipy.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
